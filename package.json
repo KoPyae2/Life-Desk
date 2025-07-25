@@ -1,0 +1,23 @@
+{
+	"name": "life-desk",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"@cloudflare/workers-types": "^4.20250725.0",
+		"typescript": "^5.5.2",
+		"vitest": "~3.2.0",
+		"wrangler": "^4.26.0"
+	},
+	"dependencies": {
+		"convex": "^1.25.4",
+		"hono": "^4.8.6"
+	}
+}
