@@ -6,6 +6,24 @@
 
 import { CommandHandler } from './commands';
 
+// Cloudflare types
+declare global {
+	interface D1Database {
+		prepare(query: string): D1PreparedStatement;
+	}
+	
+	interface D1PreparedStatement {
+		bind(...values: any[]): D1PreparedStatement;
+		first(): Promise<any>;
+		all(): Promise<{ results: any[] }>;
+		run(): Promise<{ meta: { last_row_id?: number } }>;
+	}
+	
+	interface Ai {
+		run(model: string, options: any): Promise<any>;
+	}
+}
+
 export interface TelegramPhoto {
 	file_id: string;
 	file_unique_id: string;
@@ -73,6 +91,10 @@ export class TelegramBot {
 	constructor(token: string) {
 		this.token = token;
 		this.apiUrl = `https://api.telegram.org/bot${token}`;
+	}
+
+	get botToken(): string {
+		return this.token;
 	}
 
 	async sendMessage(chatId: number, text: string, parseMode?: string, replyMarkup?: any): Promise<Response> {
@@ -172,10 +194,23 @@ export class TelegramBot {
 	async downloadFile(filePath: string): Promise<Response> {
 		return fetch(`https://api.telegram.org/file/bot${this.token}/${filePath}`);
 	}
+
+	async deleteMessage(chatId: number, messageId: number): Promise<Response> {
+		return fetch(`${this.apiUrl}/deleteMessage`, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				chat_id: chatId,
+				message_id: messageId,
+			}),
+		});
+	}
 }
 
-export async function handleTelegramUpdate(update: TelegramUpdate, bot: TelegramBot, database: D1Database, ai: Ai): Promise<void> {
-	const commandHandler = new CommandHandler(bot, database, ai);
+export async function handleTelegramUpdate(update: TelegramUpdate, bot: TelegramBot, database: D1Database, ai: Ai, freepikApiKey: string): Promise<void> {
+	const commandHandler = new CommandHandler(bot, database, ai, freepikApiKey);
 
 	try {
 		// Handle callback queries (inline button clicks)
@@ -215,6 +250,15 @@ export async function handleTelegramUpdate(update: TelegramUpdate, bot: Telegram
 		}
 
 		const text = message.text;
+
+		// Check if user is waiting for image prompt
+		const isWaitingForImage = await commandHandler.isWaitingForImagePrompt(chatId);
+		console.log('Checking image prompt session for user', chatId, ':', isWaitingForImage);
+		if (isWaitingForImage) {
+			console.log('Handling image prompt:', text);
+			await commandHandler.handleImagePrompt(chatId, text);
+			return;
+		}
 
 		// Check if user is in input mode (waiting for note/todo/expense input)
 		const inputMode = await commandHandler.getUserInputMode(chatId);
@@ -263,9 +307,13 @@ export async function handleTelegramUpdate(update: TelegramUpdate, bot: Telegram
 				await commandHandler.handleHelp(chatId);
 				break;
 
-			case '/reminders':
-				await commandHandler.handleReminders(chatId);
-				break;
+			case '/timezone':
+					await commandHandler.handleTimezone(chatId, commandText);
+					break;
+
+			case '/image':
+					await commandHandler.handleImageCommand(chatId);
+					break;
 
 			default:
 				await commandHandler.handleUnknownCommand(chatId, text);

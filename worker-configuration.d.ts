@@ -2,4 +2,5 @@
 // After adding bindings to `wrangler.jsonc`, regenerate this interface via `npm run cf-typegen`
 interface Env {
 	BOT_TOKEN: string;
+	FREEPIK_API_KEY:string;
 }

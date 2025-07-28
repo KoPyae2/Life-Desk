@@ -6,11 +6,31 @@
 
 import { TelegramBot, TelegramPhoto } from './webhook';
 
+// Cloudflare types
+declare global {
+	interface D1Database {
+		prepare(query: string): D1PreparedStatement;
+	}
+	
+	interface D1PreparedStatement {
+		bind(...values: any[]): D1PreparedStatement;
+		first(): Promise<any>;
+		all(): Promise<{ results: any[] }>;
+		run(): Promise<{ meta: { last_row_id?: number } }>;
+	}
+	
+	interface Ai {
+		run(model: string, options: any): Promise<any>;
+	}
+}
+
 // Types for our data structures
 export interface User {
 	telegramId: number;
 	firstName: string;
 	username?: string;
+	timezone?: string;
+	timezoneOffset?: number;
 	createdAt: number;
 	lastActiveAt: number;
 }
@@ -50,16 +70,15 @@ export interface UserInputState {
 	createdAt: number;
 }
 
-export interface Reminder {
-	id: number;
-	userId: number;
-	content: string;
-	reminderTime: number;
-	isSent: boolean;
-	sourceType: 'note' | 'todo' | 'manual';
-	sourceId?: string;
-	createdAt: number;
+// Freepik API types
+export interface FreepikImageResponse {
+	data: Array<{
+		base64: string;
+	}>;
+	message?: string;
 }
+
+
 
 // D1 Database Service
 class DatabaseService {
@@ -73,12 +92,22 @@ class DatabaseService {
 	async createUser(user: Omit<User, 'createdAt' | 'lastActiveAt'>): Promise<User> {
 		const now = Date.now();
 		const result = await this.db.prepare(`
-			INSERT INTO users (telegram_id, first_name, username, created_at, last_active_at)
-			VALUES (?, ?, ?, ?, ?)
-		`).bind(user.telegramId, user.firstName, user.username || null, now, now).run();
+			INSERT INTO users (telegram_id, first_name, username, timezone, timezone_offset, created_at, last_active_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`).bind(
+			user.telegramId, 
+			user.firstName, 
+			user.username || null, 
+			user.timezone || 'UTC', 
+			user.timezoneOffset || 0, 
+			now, 
+			now
+		).run();
 
 		return {
 			...user,
+			timezone: user.timezone || 'UTC',
+			timezoneOffset: user.timezoneOffset || 0,
 			createdAt: now,
 			lastActiveAt: now
 		};
@@ -95,9 +124,19 @@ class DatabaseService {
 			telegramId: result.telegram_id as number,
 			firstName: result.first_name as string,
 			username: result.username as string | undefined,
+			timezone: result.timezone as string | undefined,
+			timezoneOffset: result.timezone_offset as number | undefined,
 			createdAt: result.created_at as number,
 			lastActiveAt: result.last_active_at as number
 		};
+	}
+	
+	async updateUserTimezone(telegramId: number, timezone: string, timezoneOffset: number): Promise<void> {
+		await this.db.prepare(`
+			UPDATE users SET timezone = ?, timezone_offset = ? WHERE telegram_id = ?
+		`).bind(timezone, timezoneOffset, telegramId).run();
+		
+		console.log(`Updated timezone for user ${telegramId}: ${timezone} (offset: ${timezoneOffset})`);
 	}
 
 	async updateUserActivity(telegramId: number): Promise<void> {
@@ -310,118 +349,7 @@ class DatabaseService {
 		`).bind(userId).run();
 	}
 
-	// Smart Reminders management
-	async createReminder(userId: number, content: string, reminderTime: number, sourceType: 'note' | 'todo' | 'manual', sourceId?: string): Promise<number> {
-		try {
-			const result = await this.db.prepare(`
-				INSERT INTO reminders (user_id, content, reminder_time, source_type, source_id, created_at)
-				VALUES (?, ?, ?, ?, ?, ?)
-			`).bind(userId, content, reminderTime, sourceType, sourceId || null, Date.now()).run();
-			
-			return result.meta.last_row_id as number;
-		} catch (error) {
-			console.error('Error creating reminder:', error);
-			throw error;
-		}
-	}
 
-	async getPendingReminders(): Promise<Reminder[]> {
-		try {
-			const now = Date.now();
-			const result = await this.db.prepare(`
-				SELECT * FROM reminders 
-				WHERE is_sent = 0 AND reminder_time <= ?
-				ORDER BY reminder_time ASC
-			`).bind(now).all();
-			
-			if (!result.results) {
-				return [];
-			}
-			
-			return result.results.map(row => ({
-				id: row.id as number,
-				userId: row.user_id as number,
-				content: row.content as string,
-				reminderTime: row.reminder_time as number,
-				isSent: Boolean(row.is_sent),
-				sourceType: row.source_type as 'note' | 'todo' | 'manual',
-				sourceId: row.source_id as string | undefined,
-				createdAt: row.created_at as number
-			}));
-		} catch (error) {
-			console.error('Error getting pending reminders:', error);
-			return [];
-		}
-	}
-
-	async markReminderSent(reminderId: number): Promise<void> {
-		try {
-			await this.db.prepare(`
-				UPDATE reminders SET is_sent = 1 WHERE id = ?
-			`).bind(reminderId).run();
-		} catch (error) {
-			console.error('Error marking reminder as sent:', error);
-		}
-	}
-
-	async getUpcomingReminders(userId: number, limit: number = 5): Promise<Reminder[]> {
-		try {
-			const now = Date.now();
-			const result = await this.db.prepare(`
-				SELECT * FROM reminders 
-				WHERE user_id = ? AND is_sent = 0 AND reminder_time > ?
-				ORDER BY reminder_time ASC
-				LIMIT ?
-			`).bind(userId, now, limit).all();
-			
-			if (!result.results) {
-				return [];
-			}
-			
-			return result.results.map(row => ({
-				id: row.id as number,
-				userId: row.user_id as number,
-				content: row.content as string,
-				reminderTime: row.reminder_time as number,
-				isSent: Boolean(row.is_sent),
-				sourceType: row.source_type as 'note' | 'todo' | 'manual',
-				sourceId: row.source_id as string | undefined,
-				createdAt: row.created_at as number
-			}));
-		} catch (error) {
-			console.error('Error getting upcoming reminders:', error);
-			return [];
-		}
-	}
-
-	async getUserReminders(userId: number, limit: number = 10): Promise<Reminder[]> {
-		try {
-			const result = await this.db.prepare(`
-				SELECT * FROM reminders 
-				WHERE user_id = ? AND is_sent = 0
-				ORDER BY reminder_time ASC
-				LIMIT ?
-			`).bind(userId, limit).all();
-			
-			if (!result.results) {
-				return [];
-			}
-			
-			return result.results.map(row => ({
-				id: row.id as number,
-				userId: row.user_id as number,
-				content: row.content as string,
-				reminderTime: row.reminder_time as number,
-				isSent: Boolean(row.is_sent),
-				sourceType: row.source_type as 'note' | 'todo' | 'manual',
-				sourceId: row.source_id as string | undefined,
-				createdAt: row.created_at as number
-			}));
-		} catch (error) {
-			console.error('Error getting user reminders:', error);
-			return [];
-		}
-	}
 
 	// Get recent items for display
 	async getRecentNotes(userId: number, limit: number = 5): Promise<Note[]> {
@@ -526,16 +454,33 @@ function categorizeNote(content: string): Note['category'] {
 	return 'general';
 }
 
+// Global session storage for image prompts (persists across requests)
+const globalImagePromptSessions = new Map<number, number>(); // chatId -> timestamp
+
+// Cleanup old sessions periodically
+function cleanupOldImageSessions() {
+	const now = Date.now();
+	const tenMinutesAgo = now - 10 * 60 * 1000;
+	
+	for (const [chatId, timestamp] of globalImagePromptSessions.entries()) {
+		if (timestamp < tenMinutesAgo) {
+			globalImagePromptSessions.delete(chatId);
+		}
+	}
+}
+
 // Command handlers
 export class CommandHandler {
 	private bot: TelegramBot;
 	private db: DatabaseService;
 	private ai: Ai;
+	private freepikApiKey: string;
 
-	constructor(bot: TelegramBot, database: D1Database, ai: Ai) {
+	constructor(bot: TelegramBot, database: D1Database, ai: Ai, freepikApiKey: string) {
 		this.bot = bot;
 		this.db = new DatabaseService(database);
 		this.ai = ai;
+		this.freepikApiKey = freepikApiKey;
 	}
 
 	// Check if user is in input mode
@@ -545,6 +490,7 @@ export class CommandHandler {
 
 	// Handle user input when in input mode
 	async handleUserInput(chatId: number, text: string, inputState: UserInputState): Promise<void> {
+		console.log('handleUserInput called with mode:', inputState.mode, 'text:', text);
 		await this.db.updateUserActivity(chatId);
 
 		switch (inputState.mode) {
@@ -560,6 +506,7 @@ export class CommandHandler {
 		}
 
 		// Clear input state
+		console.log('Clearing input state for user:', chatId);
 		await this.db.clearUserInputState(chatId);
 	}
 
@@ -580,6 +527,9 @@ export class CommandHandler {
 			case 'create_expense':
 				await this.startExpenseInput(chatId, messageId);
 				break;
+			case 'create_image':
+				await this.startImageInput(chatId, messageId);
+				break;
 			case 'complete_todo':
 				const todoId = params[0];
 				await this.completeTodoById(chatId, messageId, todoId);
@@ -596,9 +546,7 @@ export class CommandHandler {
 			case 'show_summary':
 				await this.showSummaryInline(chatId, messageId);
 				break;
-			case 'show_reminders':
-				await this.showRemindersInline(chatId, messageId);
-				break;
+
 			case 'back_home':
 				await this.showHomeInline(chatId, messageId, firstName);
 				break;
@@ -635,7 +583,7 @@ Your next-gen productivity companion with beautiful interactive interface.
 				],
 				[
 					{ text: '💰 Expenses', callback_data: 'refresh_expenses' },
-					{ text: '🎯 Reminders', callback_data: 'show_reminders' }
+					{ text: '🎨 Generate Image', callback_data: 'create_image' }
 				],
 				[
 					{ text: '📊 Summary', callback_data: 'show_summary' }
@@ -661,7 +609,7 @@ Your next-gen productivity companion with beautiful interactive interface.
 				],
 				[
 					{ text: '💰 Expenses', callback_data: 'refresh_expenses' },
-					{ text: '🎯 Reminders', callback_data: 'show_reminders' }
+					{ text: '🎨 Generate Image', callback_data: 'create_image' }
 				],
 				[
 					{ text: '📊 Summary', callback_data: 'show_summary' }
@@ -683,6 +631,23 @@ Your next-gen productivity companion with beautiful interactive interface.
 
 	async handleExpenseCommand(chatId: number): Promise<void> {
 		await this.refreshExpensesList(chatId);
+	}
+
+	async handleImageCommand(chatId: number, prompt?: string): Promise<void> {
+		await this.db.updateUserActivity(chatId);
+		
+		if (!prompt) {
+			// No prompt provided, ask for one and set session state
+			console.log('Setting image prompt session for user:', chatId);
+			globalImagePromptSessions.set(chatId, Date.now());
+			console.log('Current image sessions:', Array.from(globalImagePromptSessions.keys()));
+			const message = `🎨 *Generate AI Image*\n\n✍️ Describe the image you want to create:\n\n_Examples:_\n• A beautiful sunset over mountains with a lake\n• A cute cat wearing a wizard hat\n• Modern city skyline at night with neon lights\n\n💡 Be descriptive for best results!`;
+			await this.bot.sendMessage(chatId, message, 'Markdown');
+			return;
+		}
+
+		// Prompt provided, generate image
+		await this.generateAndSendImage(chatId, prompt);
 	}
 
 	// Display notes list with create button
@@ -804,7 +769,7 @@ Your next-gen productivity companion with beautiful interactive interface.
 	async startNoteInput(chatId: number, messageId: number): Promise<void> {
 		await this.db.setUserInputState(chatId, 'note');
 		
-		const message = `📝 *Create New Note*\n\n✍️ Send me your note content:\n\n_Examples:_\n• Buy milk on way home\n• Great restaurant: Tony's Pizza\n• Meeting notes: Project deadline Friday\n\n🎯 *Add Reminders:* Use "Reminder at" keyword!\n• "Wake me up Reminder at 8am"\n• "Call mom Reminder at today 5:10 pm"\n• "Meeting Reminder at tomorrow 3pm"\n• "Birthday party Reminder at 12:2:2026 7pm"\n\n💡 I'll automatically categorize and set reminders for you!`;
+		const message = `📝 *Create New Note*\n\n✍️ Send me your note content:\n\n_Examples:_\n• Buy milk on way home\n• Great restaurant: Tony's Pizza\n• Meeting notes: Project deadline Friday\n\n💡 I'll automatically categorize your notes for you!`;
 		
 		await this.bot.editMessageText(chatId, messageId, message, 'Markdown');
 	}
@@ -812,7 +777,7 @@ Your next-gen productivity companion with beautiful interactive interface.
 	async startTodoInput(chatId: number, messageId: number): Promise<void> {
 		await this.db.setUserInputState(chatId, 'todo');
 		
-		const message = `✅ *Create New Todo*\n\n✍️ Send me your task:\n\n_Examples:_\n• Call dentist tomorrow\n• Finish report due Friday\n• Buy birthday gift for mom\n\n🎯 *Add Reminders:* Use "Reminder at" keyword!\n• "Call dentist Reminder at tomorrow 9am"\n• "Submit report Reminder at today 6pm"\n• "Buy gift Reminder at 15:12:2025 2pm"\n\n💡 I'll automatically set reminders and due dates for you!`;
+		const message = `✅ *Create New Todo*\n\n✍️ Send me your task:\n\n_Examples:_\n• Call dentist tomorrow\n• Finish report due Friday\n• Buy birthday gift for mom\n\n💡 I'll automatically set due dates for you!`;
 		
 		await this.bot.editMessageText(chatId, messageId, message, 'Markdown');
 	}
@@ -825,6 +790,17 @@ Your next-gen productivity companion with beautiful interactive interface.
 		await this.bot.editMessageText(chatId, messageId, message, 'Markdown');
 	}
 
+	async startImageInput(chatId: number, messageId: number): Promise<void> {
+		// Set session state for image input
+		console.log('Setting image prompt session for user (inline):', chatId);
+		globalImagePromptSessions.set(chatId, Date.now());
+		console.log('Current image sessions:', Array.from(globalImagePromptSessions.keys()));
+		
+		const message = `🎨 *Generate AI Image*\n\n✍️ Describe the image you want to create:\n\n_Examples:_\n• A beautiful sunset over mountains with a lake\n• A cute cat wearing a wizard hat\n• Modern city skyline at night with neon lights\n\n💡 Be descriptive for best results!`;
+		
+		await this.bot.editMessageText(chatId, messageId, message, 'Markdown');
+	}
+
 	// Process input
 	async processNoteInput(chatId: number, text: string): Promise<void> {
 		const note = await this.db.createNote({
@@ -833,38 +809,6 @@ Your next-gen productivity companion with beautiful interactive interface.
 			category: categorizeNote(text)
 		});
 
-		// Check for reminder keywords in text
-		let reminderMessage = '';
-		try {
-			const reminderDetection = this.parseReminderFromText(text);
-			console.log('Reminder detection result:', reminderDetection);
-
-			if (reminderDetection.hasReminder && reminderDetection.reminderTime && reminderDetection.cleanText) {
-				console.log('Creating reminder:', {
-					userId: chatId,
-					content: reminderDetection.cleanText,
-					reminderTime: reminderDetection.reminderTime,
-					readableTime: new Date(reminderDetection.reminderTime).toLocaleString()
-				});
-				
-				await this.db.createReminder(
-					chatId, 
-					reminderDetection.cleanText, 
-					reminderDetection.reminderTime, 
-					'note', 
-					note.id
-				);
-				
-				const timeDisplay = this.formatReminderTime(reminderDetection.reminderTime);
-				reminderMessage = `\n\n🎯 *Reminder Set!*\n⏰ ${timeDisplay}\n💭 "${reminderDetection.cleanText}"`;
-			} else {
-				console.log('No reminder detected in text:', text);
-			}
-		} catch (error) {
-			console.error('Error creating reminder for note:', error);
-			// Continue without reminder - don't break the note creation
-		}
-
 		const categoryEmoji = {
 			'link': '🔗',
 			'task': '✅', 
@@ -872,7 +816,7 @@ Your next-gen productivity companion with beautiful interactive interface.
 			'general': '📝'
 		};
 
-		const message = `${categoryEmoji[note.category || 'general']} *Note saved!*\n\n"${text}"\n\n✨ _Automatically categorized as ${note.category}_${reminderMessage}`;
+		const message = `${categoryEmoji[note.category || 'general']} *Note saved!*\n\n"${text}"\n\n✨ _Automatically categorized as ${note.category}_`;
 		
 		const keyboard = {
 			inline_keyboard: [
@@ -894,36 +838,12 @@ Your next-gen productivity companion with beautiful interactive interface.
 			completed: false
 		});
 
-		// Check for reminder keywords in text
-		let reminderMessage = '';
-		try {
-			const reminderDetection = this.parseReminderFromText(text);
-
-			if (reminderDetection.hasReminder && reminderDetection.reminderTime && reminderDetection.cleanText) {
-				await this.db.createReminder(
-					chatId, 
-					reminderDetection.cleanText, 
-					reminderDetection.reminderTime, 
-					'todo', 
-					todo.id
-				);
-				
-				const timeDisplay = this.formatReminderTime(reminderDetection.reminderTime);
-				reminderMessage = `\n\n🎯 *Reminder Set!*\n⏰ ${timeDisplay}\n💭 "${reminderDetection.cleanText}"`;
-			}
-		} catch (error) {
-			console.error('Error creating reminder for todo:', error);
-			// Continue without reminder - don't break the todo creation
-		}
-
 		let message = `✅ *Todo created!*\n\n"${text}"`;
 		
 		if (dueDate) {
 			const date = new Date(dueDate);
 			message += `\n📅 _Due: ${date.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}_`;
 		}
-
-		message += reminderMessage;
 
 		const keyboard = {
 			inline_keyboard: [
@@ -977,6 +897,207 @@ Your next-gen productivity companion with beautiful interactive interface.
 		await this.bot.sendMessage(chatId, message, 'Markdown', keyboard);
 	}
 
+	async processImageInput(chatId: number, prompt: string): Promise<void> {
+		console.log('processImageInput called with:', { chatId, prompt });
+		try {
+			await this.generateAndSendImage(chatId, prompt);
+			console.log('generateAndSendImage completed successfully');
+		} catch (error) {
+			console.error('Error in processImageInput:', error);
+			throw error; // Re-throw to be caught by the main handler
+		}
+	}
+
+	// Image prompt session methods
+	async isWaitingForImagePrompt(chatId: number): Promise<boolean> {
+		// Clean up old sessions first
+		cleanupOldImageSessions();
+		
+		const sessionTime = globalImagePromptSessions.get(chatId);
+		if (!sessionTime) {
+			console.log('isWaitingForImagePrompt check for user', chatId, ': false (no session)');
+			return false;
+		}
+		
+		// Check if session is still valid (within 10 minutes)
+		const isValid = Date.now() - sessionTime < 10 * 60 * 1000;
+		if (!isValid) {
+			globalImagePromptSessions.delete(chatId);
+			console.log('isWaitingForImagePrompt check for user', chatId, ': false (expired)');
+			return false;
+		}
+		
+		console.log('isWaitingForImagePrompt check for user', chatId, ': true');
+		console.log('All active sessions:', Array.from(globalImagePromptSessions.keys()));
+		return true;
+	}
+
+	async handleImagePrompt(chatId: number, prompt: string): Promise<void> {
+		// Clear the session state
+		console.log('Clearing image prompt session for user:', chatId);
+		globalImagePromptSessions.delete(chatId);
+		
+		// Generate the image
+		await this.generateAndSendImage(chatId, prompt);
+	}
+
+	async generateAndSendImage(chatId: number, prompt: string): Promise<void> {
+		let statusMessageId: number | null = null;
+		
+		try {
+			console.log('Starting image generation for prompt:', prompt);
+			console.log('API Key available:', this.freepikApiKey ? 'Yes' : 'No');
+			
+			// Send initial status message
+			const statusResponse = await this.bot.sendMessage(chatId, '🎨 Generating your masterpiece...');
+			const statusData = await statusResponse.json() as any;
+			statusMessageId = statusData.result?.message_id;
+
+			console.log('Making request to Freepik API with prompt:', prompt);
+
+			// Make request to Freepik API with a timeout
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 180000); // 3 minute timeout
+
+			const FREEPIK_API_URL = `https://api.freepik.com/v1/ai/text-to-image`;
+			const requestBody = {
+				prompt: prompt,
+				styling: {
+					style: "photo",
+					color: "pastel",
+					lightning: "cinematic",
+					framing: "aerial-view",
+				},
+				image: {
+					size: "social_story_9_16",
+				},
+			};
+
+			console.log('Sending request to Freepik API with body:', JSON.stringify(requestBody));
+
+			const response = await fetch(FREEPIK_API_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					"x-freepik-api-key": this.freepikApiKey,
+				},
+				body: JSON.stringify(requestBody),
+				signal: controller.signal
+			});
+
+			clearTimeout(timeout);
+
+			console.log('API Response status:', response.status, response.statusText);
+
+			let data: FreepikImageResponse;
+			try {
+				data = await response.json() as FreepikImageResponse;
+				console.log('API Response structure:', {
+					hasData: !!data,
+					hasDataArray: !!data?.data,
+					arrayLength: data?.data?.length,
+					firstItemKeys: data?.data?.[0] ? Object.keys(data.data[0]) : [],
+					fullResponse: JSON.stringify(data).substring(0, 500) // First 500 chars for debugging
+				});
+			} catch (jsonError) {
+				console.error('Failed to parse API response as JSON:', jsonError);
+				const responseText = await response.text();
+				console.error('Raw response:', responseText.substring(0, 1000));
+				throw new Error('Invalid API response format');
+			}
+
+			if (!response.ok || !data || !data.data || data.data.length === 0) {
+				console.error('API Error Response:', {
+					status: response.status,
+					statusText: response.statusText,
+					data: data
+				});
+				throw new Error(data.message || 'Image generation failed');
+			}
+
+			const base64Image = data.data[0]?.base64;
+			if (!base64Image) {
+				console.error('Invalid API response format:', data);
+				throw new Error('No image data in response');
+			}
+
+			console.log('Received base64 image data, length:', base64Image.length);
+
+			// Convert base64 to Uint8Array
+			let bytes: Uint8Array;
+			try {
+				// Try using atob first
+				const binaryString = atob(base64Image);
+				bytes = new Uint8Array(binaryString.length);
+				for (let i = 0; i < binaryString.length; i++) {
+					bytes[i] = binaryString.charCodeAt(i);
+				}
+				console.log('Converted base64 to Uint8Array using atob, length:', bytes.length);
+			} catch (atobError) {
+				console.error('atob failed:', atobError);
+				throw new Error('Failed to decode base64 image data');
+			}
+
+			// Delete the status message
+			if (statusMessageId) {
+				try {
+					await this.bot.deleteMessage(chatId, statusMessageId);
+				} catch (error) {
+					console.log('Failed to delete status message:', error);
+				}
+			}
+
+			// Send the image using sendPhoto with form data
+			const formData = new FormData();
+			formData.append('chat_id', chatId.toString());
+			formData.append('photo', new Blob([bytes], { type: 'image/png' }), 'generated_image.png');
+			formData.append('caption', `🎨 Generated image for: "${prompt}"`);
+
+			const photoResponse = await fetch(`https://api.telegram.org/bot${this.bot.botToken}/sendPhoto`, {
+				method: 'POST',
+				body: formData
+			});
+
+			if (!photoResponse.ok) {
+				throw new Error('Failed to send image to Telegram');
+			}
+
+			console.log('Successfully sent image to Telegram');
+
+		} catch (error) {
+			console.error('Detailed error in generateAndSendImage:', {
+				error: error instanceof Error ? {
+					name: error.name,
+					message: error.message,
+					stack: error.stack
+				} : error,
+				prompt: prompt,
+				apiKey: this.freepikApiKey ? 'Present (length: ' + this.freepikApiKey.length + ')' : 'Missing'
+			});
+
+			// Update the status message with error
+			const errorMessage = error instanceof Error && error.name === 'AbortError' 
+				? '⚠️ Image generation timed out. Please try again.'
+				: '⚠️ Failed to generate image. Please try again later.';
+
+			if (statusMessageId) {
+				try {
+					await this.bot.editMessageText(chatId, statusMessageId, errorMessage);
+				} catch (editError) {
+					console.log('Failed to edit status message:', editError);
+					// Send new error message if editing fails
+					await this.bot.sendMessage(chatId, errorMessage);
+				}
+			} else {
+				await this.bot.sendMessage(chatId, errorMessage);
+			}
+		} finally {
+			// Always clear the image prompt session state
+			console.log('Clearing image prompt session in finally block for user:', chatId);
+			globalImagePromptSessions.delete(chatId);
+		}
+	}
+
 	// Complete todo
 	async completeTodoById(chatId: number, messageId: number, todoId: string): Promise<void> {
 		await this.db.completeTodo(todoId);
@@ -1027,7 +1148,8 @@ _Next summary: Every Sunday automatically_`;
 					{ text: '✅ Todos', callback_data: 'refresh_todos' }
 				],
 				[
-					{ text: '💰 Expenses', callback_data: 'refresh_expenses' }
+					{ text: '💰 Expenses', callback_data: 'refresh_expenses' },
+					{ text: '🎨 Generate Image', callback_data: 'create_image' }
 				]
 			]
 		};
@@ -1055,6 +1177,11 @@ _Next summary: Every Sunday automatically_`;
    • Weekly totals and insights
    • Simple format: amount + description
 
+🎨 */image* - AI Image Generation
+   • Generate beautiful images from text prompts
+   • Powered by Freepik AI
+   • High-quality artistic results
+
 📊 */summary* - Beautiful weekly overview
    • Comprehensive productivity insights
    • Spending analysis and trends
@@ -1076,6 +1203,9 @@ Ready for next-gen productivity? 🚀`;
 				],
 				[
 					{ text: '💰 Try Expenses', callback_data: 'refresh_expenses' },
+					{ text: '🎨 Generate Image', callback_data: 'create_image' }
+				],
+				[
 					{ text: '📊 View Summary', callback_data: 'show_summary' }
 				]
 			]
@@ -1116,7 +1246,8 @@ _Next summary: Every Sunday automatically_`;
 					{ text: '✅ Todos', callback_data: 'refresh_todos' }
 				],
 				[
-					{ text: '💰 Expenses', callback_data: 'refresh_expenses' }
+					{ text: '💰 Expenses', callback_data: 'refresh_expenses' },
+					{ text: '🎨 Generate Image', callback_data: 'create_image' }
 				]
 			]
 		};
@@ -1134,13 +1265,11 @@ _Next summary: Every Sunday automatically_`;
    • View your notes with inline buttons
    • Create new notes interactively
    • Auto-categorization (link, task, idea, general)
-   • 🎯 Add "Reminder at" keyword for reminders
 
 ✅ */todo* - Smart task management  
    • Interactive todo list with completion buttons
    • Natural language dates ("tomorrow", "Friday")
    • One-tap task completion
-   • 🎯 Add "Reminder at" keyword for reminders
 
 💰 */expense* - Elegant expense tracking
    • Interactive expense logging
@@ -1153,7 +1282,6 @@ _Next summary: Every Sunday automatically_`;
    • Motivational feedback
 
 💡 *Pro Features:*
-• 🎯 Keyword-based reminders: "Reminder at tomorrow 8am"
 • Beautiful inline keyboards for everything
 • No typing commands - just tap buttons!
 • Smart categorization and date parsing
@@ -1184,6 +1312,7 @@ Ready for next-gen productivity? 🚀`;
 📝 /note - Manage your notes
 ✅ /todo - Manage your tasks  
 💰 /expense - Track expenses
+🎨 /image - Generate AI images
 📊 /summary - View weekly summary
 🏠 /home - Main menu
 ❓ /help - Show help
@@ -1193,146 +1322,14 @@ Ready for next-gen productivity? 🚀`;
 		await this.bot.sendMessage(chatId, response, 'Markdown');
 	}
 
-	async handleReminders(chatId: number): Promise<void> {
-		await this.db.updateUserActivity(chatId);
 
-		try {
-			const reminders = await this.db.getUserReminders(chatId, 10);
 
-		if (reminders.length === 0) {
-			const response = `🎯 *Smart Reminders*
 
-You don't have any pending reminders yet.
-
-💡 *How it works:*
-When you create notes or todos with time references like "tomorrow", "next week", or "at 3pm", I'll automatically set smart reminders for you!
-
-*Examples:*
-📝 "Call mom tomorrow" → Reminder set for tomorrow 9 AM
-✅ "Meeting at 3pm" → Reminder set for today 3 PM
-📝 "Buy groceries next week" → Reminder set for next week
-
-*Try creating a note or todo with a time reference!*`;
-
-			await this.bot.sendMessage(chatId, response, 'Markdown');
-			return;
-		}
-
-		let response = `🎯 *Your Smart Reminders*\n\n`;
-
-		reminders.forEach((reminder, index) => {
-			const date = new Date(reminder.reminderTime);
-			const sourceIcon = reminder.sourceType === 'note' ? '📝' : '✅';
-			
-			response += `${index + 1}. ${sourceIcon} *${reminder.content}*\n`;
-			response += `   ⏰ ${date.toLocaleString()}\n`;
-			response += `   📍 From ${reminder.sourceType}\n\n`;
-		});
-
-		response += `💡 _Smart reminders are automatically created when you add notes or todos with time references!_`;
-
-		await this.bot.sendMessage(chatId, response, 'Markdown');
-		} catch (error) {
-			console.error('Error handling reminders:', error);
-			
-			const errorResponse = `🎯 *Smart Reminders*
-
-Sorry, there was an issue loading your reminders. Please try again in a moment.
-
-💡 *How it works:*
-When you create notes or todos with time references like "tomorrow", "next week", or "at 3pm", I'll automatically set smart reminders for you!
-
-*Try creating a note or todo with a time reference!*`;
-
-			await this.bot.sendMessage(chatId, errorResponse, 'Markdown');
-		}
-	}
-
-	async showRemindersInline(chatId: number, messageId: number): Promise<void> {
-		try {
-			const reminders = await this.db.getUserReminders(chatId, 10);
-
-			if (reminders.length === 0) {
-			const response = `🎯 *Smart Reminders*
-
-You don't have any pending reminders yet.
-
-💡 *How it works:*
-When you create notes or todos with time references like "tomorrow", "next week", or "at 3pm", I'll automatically set smart reminders for you!
-
-*Examples:*
-📝 "Call mom tomorrow" → Reminder set for tomorrow 9 AM
-✅ "Meeting at 3pm" → Reminder set for today 3 PM
-📝 "Buy groceries next week" → Reminder set for next week
-
-*Try creating a note or todo with a time reference!*`;
-
-			const keyboard = {
-				inline_keyboard: [
-					[{ text: '🏠 Back to Home', callback_data: 'back_home' }]
-				]
-			};
-
-			await this.bot.editMessageText(chatId, messageId, response, 'Markdown', keyboard);
-			return;
-		}
-
-		let response = `🎯 *Your Smart Reminders*\n\n`;
-
-		reminders.forEach((reminder, index) => {
-			const date = new Date(reminder.reminderTime);
-			const sourceIcon = reminder.sourceType === 'note' ? '📝' : '✅';
-			
-			response += `${index + 1}. ${sourceIcon} *${reminder.content}*\n`;
-			response += `   ⏰ ${date.toLocaleString()}\n`;
-			response += `   📍 From ${reminder.sourceType}\n\n`;
-		});
-
-		response += `💡 _Smart reminders are automatically created when you add notes or todos with time references!_`;
-
-		const keyboard = {
-			inline_keyboard: [
-				[{ text: '🏠 Back to Home', callback_data: 'back_home' }]
-			]
-		};
-
-		await this.bot.editMessageText(chatId, messageId, response, 'Markdown', keyboard);
-		} catch (error) {
-			console.error('Error showing reminders:', error);
-			
-			const errorResponse = `🎯 *Smart Reminders*
-
-Sorry, there was an issue loading your reminders. Please try again in a moment.
-
-💡 *How it works:*
-When you create notes or todos with time references like "tomorrow", "next week", or "at 3pm", I'll automatically set smart reminders for you!`;
-
-			const keyboard = {
-				inline_keyboard: [
-					[{ text: '🏠 Back to Home', callback_data: 'back_home' }]
-				]
-			};
-
-			await this.bot.editMessageText(chatId, messageId, errorResponse, 'Markdown', keyboard);
-		}
-	}
 
 	async showHomeInline(chatId: number, messageId: number, firstName: string): Promise<void> {
-		// Get upcoming reminders for preview
-		const upcomingReminders = await this.db.getUpcomingReminders(chatId, 3); // Get next 3 reminders
-		
-		let reminderPreview = '';
-		if (upcomingReminders.length > 0) {
-			reminderPreview = '\n\n🎯 *Upcoming Reminders:*\n';
-			upcomingReminders.forEach(reminder => {
-				const timeDisplay = this.formatReminderTime(reminder.reminderTime);
-				reminderPreview += `• ${timeDisplay}: ${reminder.content}\n`;
-			});
-		}
-
 		const homeMessage = `🏠 *Welcome back, ${firstName}!*
 
-*Choose what you'd like to do:*${reminderPreview}`;
+*Choose what you'd like to do:*`;
 
 		const keyboard = {
 			inline_keyboard: [
@@ -1342,7 +1339,7 @@ When you create notes or todos with time references like "tomorrow", "next week"
 				],
 				[
 					{ text: '💰 Expenses', callback_data: 'refresh_expenses' },
-					{ text: '🎯 Reminders', callback_data: 'show_reminders' }
+					{ text: '🎨 Generate Image', callback_data: 'create_image' }
 				],
 				[
 					{ text: '📊 Summary', callback_data: 'show_summary' }
@@ -1353,314 +1350,76 @@ When you create notes or todos with time references like "tomorrow", "next week"
 		await this.bot.editMessageText(chatId, messageId, homeMessage, 'Markdown', keyboard);
 	}
 
-	// Reminder checking system (called periodically)
-	async checkAndSendReminders(): Promise<void> {
-		try {
-			console.log('Checking reminders at:', new Date().toLocaleString());
-			const pendingReminders = await this.db.getPendingReminders();
-			console.log('Found pending reminders:', pendingReminders.length);
-
-			for (const reminder of pendingReminders) {
-				console.log('Sending reminder:', reminder);
-				const sourceIcon = reminder.sourceType === 'note' ? '📝' : '✅';
-				const reminderMessage = `🎯 *Smart Reminder!*
-
-${sourceIcon} *${reminder.content}*
-
-⏰ _This was set from your ${reminder.sourceType}_
-
-*Time to take action!* 🚀`;
-
-				await this.bot.sendMessage(reminder.userId, reminderMessage, 'Markdown');
-				await this.db.markReminderSent(reminder.id);
-				console.log('Reminder sent and marked as sent:', reminder.id);
-			}
-		} catch (error) {
-			console.error('Error checking reminders:', error);
-		}
-	}
-
-	// Parse Reminder Keywords from Text
-	parseReminderFromText(text: string): { hasReminder: boolean; reminderTime?: number; cleanText?: string } {
-		try {
-			console.log('Parsing reminder from text:', text);
+	// Timezone handling
+	async handleTimezone(chatId: number, text: string): Promise<void> {
+		await this.db.updateUserActivity(chatId);
+		
+		// If no timezone provided, show current timezone and instructions
+		if (!text || text.trim() === '') {
+			const user = await this.db.getUser(chatId);
+			const currentTimezone = user?.timezone || 'UTC';
+			const currentOffset = user?.timezoneOffset || 0;
 			
-			// Look for "Reminder at" or "Remainder at" keywords (case insensitive)
-			const reminderRegex = /\s*(reminder|remainder)\s+at\s+(.+?)$/i;
-			const match = text.match(reminderRegex);
-			
-			console.log('Regex match result:', match);
-			
-			if (!match) {
-				console.log('No reminder keyword found');
-				return { hasReminder: false };
-			}
-			
-			const timeExpression = match[2].trim();
-			const cleanText = text.replace(reminderRegex, '').trim();
-			
-			console.log('Time expression:', timeExpression);
-			console.log('Clean text:', cleanText);
-			
-			// Parse the time expression
-			const reminderTime = this.parseTimeExpression(timeExpression);
-			
-			console.log('Parsed reminder time:', reminderTime, 'Readable:', new Date(reminderTime).toLocaleString());
-			
-			return {
-				hasReminder: true,
-				reminderTime,
-				cleanText
-			};
-		} catch (error) {
-			console.error('Error parsing reminder from text:', error);
-			return { hasReminder: false };
-		}
-	}
+			const message = `🕒 *Timezone Settings*
 
-	// Smart Reminder AI Detection (keeping for backward compatibility)
-	async detectReminderFromText(text: string): Promise<{ hasReminder: boolean; reminderTime?: number; reminderText?: string }> {
-		try {
-			const aiResponse = await this.ai.run('@cf/meta/llama-3.1-8b-instruct', {
-				messages: [
-					{
-						role: 'system',
-						content: `You are a smart reminder detection AI. Analyze text and detect if it contains time-based reminders.
+Your current timezone: *${currentTimezone}*
+Offset from UTC: *${currentOffset} minutes*
 
-RULES:
-1. Look for time expressions like: "tomorrow", "next week", "in 2 hours", "at 3pm", "Monday", etc.
-2. If you find a time reference, respond with JSON: {"hasReminder": true, "timeExpression": "the time phrase", "reminderText": "what to remind about"}
-3. If no time reference, respond with JSON: {"hasReminder": false}
-4. Be smart about context - "remember to call mom tomorrow" = reminder, "I called mom yesterday" = no reminder
-5. Only detect FUTURE time references, not past ones
+To set your timezone, use:
+\`/timezone [offset]\`
 
 Examples:
-"Buy milk tomorrow" → {"hasReminder": true, "timeExpression": "tomorrow", "reminderText": "Buy milk"}
-"Meeting at 3pm" → {"hasReminder": true, "timeExpression": "at 3pm", "reminderText": "Meeting"}
-"I went shopping yesterday" → {"hasReminder": false}
-"Call John next week" → {"hasReminder": true, "timeExpression": "next week", "reminderText": "Call John"}`
-					},
-					{
-						role: 'user',
-						content: text
-					}
-				],
-				max_tokens: 150
-			});
+\`/timezone -120\` (UTC-2:00)
+\`/timezone 0\` (UTC)
+\`/timezone 60\` (UTC+1:00)
+\`/timezone 330\` (UTC+5:30)
 
-			const response = aiResponse.response || '{"hasReminder": false}';
-			
-			// Try to parse JSON response
-			try {
-				const parsed = JSON.parse(response);
-				if (parsed.hasReminder && parsed.timeExpression && parsed.reminderText) {
-					// Convert time expression to timestamp (simplified)
-					const reminderTime = this.parseTimeExpression(parsed.timeExpression);
-					return {
-						hasReminder: true,
-						reminderTime,
-						reminderText: parsed.reminderText
-					};
-				}
-			} catch (e) {
-				// If JSON parsing fails, fallback to simple detection
-				console.log('AI JSON parse failed, using fallback');
-			}
+Your timezone setting is saved for future use.`;
 
-			return { hasReminder: false };
-		} catch (error) {
-			console.error('AI reminder detection error:', error);
-			return { hasReminder: false };
+			await this.bot.sendMessage(chatId, message, 'Markdown');
+			return;
 		}
-	}
-
-	private formatReminderTime(timestamp: number): string {
-		const reminderDate = new Date(timestamp);
-		const now = new Date();
 		
-		// User-friendly time display
-		if (reminderDate.toDateString() === now.toDateString()) {
-			// Today
-			return `Today at ${reminderDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`;
-		} else if (reminderDate.toDateString() === new Date(now.getTime() + 24*60*60*1000).toDateString()) {
-			// Tomorrow
-			return `Tomorrow at ${reminderDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`;
-		} else {
-			// Other days
-			return reminderDate.toLocaleDateString('en-US', { 
-				weekday: 'long', 
-				month: 'short', 
-				day: 'numeric',
-				hour: 'numeric',
-				minute: '2-digit',
-				hour12: true
-			});
+		// Try to parse the timezone offset
+		try {
+			const offset = parseInt(text.trim());
+			if (isNaN(offset) || offset < -720 || offset > 840) {
+				// Valid timezone offsets are between -12:00 and +14:00 hours
+				await this.bot.sendMessage(chatId, 
+					'❌ Invalid timezone offset. Please provide a number between -720 and 840 (representing minutes from UTC).',
+					'Markdown'
+				);
+				return;
+			}
+			
+			// Calculate timezone name
+			const hours = Math.abs(Math.floor(offset / 60));
+			const minutes = Math.abs(offset % 60);
+			const sign = offset < 0 ? '-' : '+';
+			const timezone = `UTC${sign}${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+			
+			// Update user's timezone
+			await this.db.updateUserTimezone(chatId, timezone, offset);
+			
+			// Confirm to user
+			const message = `✅ *Timezone Updated*
+
+Your timezone is now set to: *${timezone}*
+Offset from UTC: *${offset} minutes*
+
+Your timezone setting has been saved.`;
+
+			await this.bot.sendMessage(chatId, message, 'Markdown');
+			
+		} catch (error) {
+			console.error('Error setting timezone:', error);
+			await this.bot.sendMessage(chatId, 
+				'❌ Something went wrong setting your timezone. Please try again with a valid offset in minutes.',
+				'Markdown'
+			);
 		}
 	}
-
-	private parseTimeExpression(timeExpression: string): number {
-		const now = new Date();
-		const expr = timeExpression.toLowerCase();
-
-		// Specific date formats: "12:2:2026", "12/2/2026", "2026-12-2"
-		const dateFormats = [
-			/(\d{1,2}):(\d{1,2}):(\d{4})(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?/,  // 12:2:2026 8am
-			/(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?/, // 12/2/2026 8am
-			/(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?/   // 2026-12-2 8am
-		];
-
-		for (const format of dateFormats) {
-			const match = expr.match(format);
-			if (match) {
-				let month, day, year, hour = 9, minutes = 0; // Default to 9 AM
-				
-				if (format.source.includes(':')) {
-					// Format: 12:2:2026
-					month = parseInt(match[1]) - 1; // JS months are 0-indexed
-					day = parseInt(match[2]);
-					year = parseInt(match[3]);
-				} else if (format.source.includes('/')) {
-					// Format: 12/2/2026
-					month = parseInt(match[1]) - 1;
-					day = parseInt(match[2]);
-					year = parseInt(match[3]);
-				} else {
-					// Format: 2026-12-2
-					year = parseInt(match[1]);
-					month = parseInt(match[2]) - 1;
-					day = parseInt(match[3]);
-				}
-				
-				// Parse time if provided
-				if (match[4]) {
-					hour = parseInt(match[4]);
-					minutes = match[5] ? parseInt(match[5]) : 0;
-					const ampm = match[6];
-					
-					if (ampm === 'pm' && hour !== 12) {
-						hour += 12;
-					} else if (ampm === 'am' && hour === 12) {
-						hour = 0;
-					}
-				}
-				
-				const targetDate = new Date(year, month, day, hour, minutes, 0, 0);
-				return targetDate.getTime();
-			}
-		}
-
-		// Today with specific time: "today 5:10 pm"
-		const todayMatch = expr.match(/today\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
-		if (todayMatch) {
-			let hour = parseInt(todayMatch[1]);
-			const minutes = todayMatch[2] ? parseInt(todayMatch[2]) : 0;
-			const ampm = todayMatch[3];
-			
-			if (ampm === 'pm' && hour !== 12) {
-				hour += 12;
-			} else if (ampm === 'am' && hour === 12) {
-				hour = 0;
-			}
-			
-			const targetTime = new Date(now);
-			targetTime.setHours(hour, minutes, 0, 0);
-			return targetTime.getTime();
-		}
-
-		// Tomorrow with specific time: "tomorrow 8am"
-		const tomorrowMatch = expr.match(/tomorrow\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
-		if (tomorrowMatch) {
-			let hour = parseInt(tomorrowMatch[1]);
-			const minutes = tomorrowMatch[2] ? parseInt(tomorrowMatch[2]) : 0;
-			const ampm = tomorrowMatch[3];
-			
-			if (ampm === 'pm' && hour !== 12) {
-				hour += 12;
-			} else if (ampm === 'am' && hour === 12) {
-				hour = 0;
-			}
-			
-			const tomorrow = new Date(now);
-			tomorrow.setDate(tomorrow.getDate() + 1);
-			tomorrow.setHours(hour, minutes, 0, 0);
-			return tomorrow.getTime();
-		}
-
-		// Tomorrow (default time)
-		if (expr.includes('tomorrow')) {
-			const tomorrow = new Date(now);
-			tomorrow.setDate(tomorrow.getDate() + 1);
-			tomorrow.setHours(9, 0, 0, 0); // Default to 9 AM
-			return tomorrow.getTime();
-		}
-
-		// Next week
-		if (expr.includes('next week')) {
-			const nextWeek = new Date(now);
-			nextWeek.setDate(nextWeek.getDate() + 7);
-			nextWeek.setHours(9, 0, 0, 0);
-			return nextWeek.getTime();
-		}
-
-		// In X hours
-		const hoursMatch = expr.match(/in (\d+) hours?/);
-		if (hoursMatch) {
-			const hours = parseInt(hoursMatch[1]);
-			return now.getTime() + (hours * 60 * 60 * 1000);
-		}
-
-		// In X minutes
-		const minutesMatch = expr.match(/in (\d+) minutes?/);
-		if (minutesMatch) {
-			const minutes = parseInt(minutesMatch[1]);
-			return now.getTime() + (minutes * 60 * 1000);
-		}
-
-		// Direct time formats: "5:21pm", "8am", "3:30pm", "at 5pm"
-		const timeFormats = [
-			/(?:at\s+)?(\d{1,2}):(\d{2})\s*(am|pm)/i,  // "5:21pm" or "at 5:21pm"
-			/(?:at\s+)?(\d{1,2})\s*(am|pm)/i,          // "8am" or "at 8am"
-			/(?:at\s+)?(\d{1,2}):(\d{2})/,             // "17:30" or "at 17:30"
-			/(?:at\s+)?(\d{1,2})(?::(\d{2}))?/         // "5" or "5:30"
-		];
-
-		for (const format of timeFormats) {
-			const timeMatch = expr.match(format);
-			if (timeMatch) {
-				let hour = parseInt(timeMatch[1]);
-				const minutes = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
-				const ampm = timeMatch[3];
-				
-				// Handle AM/PM
-				if (ampm) {
-					if (ampm.toLowerCase() === 'pm' && hour !== 12) {
-						hour += 12;
-					} else if (ampm.toLowerCase() === 'am' && hour === 12) {
-						hour = 0;
-					}
-				} else if (!ampm && hour <= 12) {
-					// If no AM/PM specified and hour is 1-12, assume PM for afternoon/evening
-					const currentHour = now.getHours();
-					if (hour <= 12 && currentHour >= 12) {
-						hour += 12;
-					}
-				}
-				
-				const targetTime = new Date(now);
-				targetTime.setHours(hour, minutes, 0, 0);
-				
-				// If time has passed today, set for tomorrow
-				if (targetTime.getTime() <= now.getTime()) {
-					targetTime.setDate(targetTime.getDate() + 1);
-				}
-				return targetTime.getTime();
-			}
-		}
-
-		// Default: 1 hour from now
-		return now.getTime() + (60 * 60 * 1000);
-	}
-
+	
 	// AI Features
 	async handleAIQuery(chatId: number, text: string, firstName: string, username?: string): Promise<void> {
 		await this.db.updateUserActivity(chatId);
@@ -1672,31 +1431,35 @@ Examples:
 		);
 
 		if (isCreatorQuestion) {
-			const creatorResponse = `🎯 *This bot was created by Chico!*
-
-He's an amazing developer who built this next-gen productivity assistant with beautiful interactive features and AI capabilities.
-
-You can contact him directly on Telegram: @chicorota0 (ID: 5147071138)
-
-Chico designed this bot to help people be more productive with smart notes, todos, expenses tracking, and AI-powered reminders! 🚀`;
+			const creatorResponse = `🎯 This bot was created by Chico!
+He's an amazing developer who built this next-gen productivity assistant. Chico designed this bot to help people be more productive with beautiful interactive features and AI capabilities!`;
 
 			const keyboard = {
 				inline_keyboard: [
 					[
-						{ 
-							text: '👤 View Chico\'s Profile', 
-							url: 'tg://user?id=5147071138'
+						{
+							text: '💬 Contact Chico', 
+							url: 'https://t.me/chicorota0'
+						},
+						{
+							text: '🏠 Home',
+							callback_data: 'show_home'
 						}
 					],
 					[
-						{ 
-							text: '💬 Contact Chico', 
-							url: 'https://t.me/chicorota0'
+						{
+							text: '📝 Notes',
+							callback_data: 'refresh_notes'
+						},
+						{
+							text: '✅ Tasks',
+							callback_data: 'refresh_todos'
 						}
 					]
 				]
 			};
 
+			console.log('Sending creator response with keyboard:', JSON.stringify(keyboard));
 			await this.bot.sendMessage(chatId, creatorResponse, 'Markdown', keyboard);
 			return;
 		}
@@ -1711,67 +1474,100 @@ Chico designed this bot to help people be more productive with smart notes, todo
 		try {
 			// Use Cloudflare AI to generate response
 			const aiResponse = await this.ai.run('@cf/meta/llama-3.1-8b-instruct', {
-				messages: [
-					{
-						role: 'system',
-						content: `You are a helpful AI assistant integrated into a productivity bot called Life Desk. 
-						Keep responses concise, friendly, and helpful. 
-						If the user asks about productivity, notes, todos, or expenses, guide them to use the bot's features.
-						User's name is ${firstName}.
-						
-						IMPORTANT CONTEXT:
-						- This bot has smart reminders that automatically detect time references in notes/todos
-						- When users say things like "no have", "no way", or similar short responses, they might be responding to reminder confirmations
-						- Be understanding and don't over-analyze casual responses
-						- If someone seems to be giving a short/casual response, acknowledge it naturally
-						
-						CREATOR INFO: If someone asks who created this bot, who made this, who is the developer, or similar questions, respond with:
-						"🎯 This bot was created by Chico! He's an amazing developer who built this next-gen productivity assistant. You can contact him directly on Telegram: @chicorota0 (ID: 5147071138). Chico designed this bot to help people be more productive with beautiful interactive features and AI capabilities!"
-						
-						Always mention Chico as the creator when asked about the bot's origin.`
-					},
-					{
-						role: 'user',
-						content: text
-					}
-				],
-				max_tokens: 512
-			});
+			messages: [
+				{
+					role: 'system',
+					content: `You are a helpful AI assistant integrated into a productivity bot called Life Desk. 
+					Keep responses concise, friendly, and helpful. 
+					If the user asks about productivity, notes, todos, or expenses, guide them to use the bot's features.
+					User's name is ${firstName}.
+					
+					IMPORTANT CONTEXT:
+					- This bot helps with notes, todos, and expense tracking
+					- When users give short responses like "no have", "no way", acknowledge them naturally
+					- Be understanding and don't over-analyze casual responses
+					
+					CREATOR INFO: If someone asks who created this bot, who made this, who is the developer, or similar questions, respond with:
+					"🎯 This bot was created by Chico! He's an amazing developer who built this next-gen productivity assistant. Chico designed this bot to help people be more productive with beautiful interactive features and AI capabilities!"
+					
+					Always mention Chico as the creator when asked about the bot's origin.`
+				},
+				{
+					role: 'user',
+					content: text
+				}
+			],
+			max_tokens: 512
+		});
 
-			const response = aiResponse.response || 'Sorry, I could not process your request.';
+		const response = aiResponse.response || 'Sorry, I could not process your request.';
 
-			// Edit the processing message with the AI response
-			const processingResponse = await processingMessage.json() as any;
-			const messageId = processingResponse.result?.message_id;
+		// Check if AI response contains creator information and add keyboard
+		const isCreatorResponse = response.toLowerCase().includes('chico') && 
+								 (response.toLowerCase().includes('created') || response.toLowerCase().includes('developer'));
 
-			if (messageId) {
-				await this.bot.editMessageText(
-					chatId, 
-					messageId, 
-					`🤖 *AI Assistant*\n\n${response}`, 
-					'Markdown'
-				);
-			} else {
-				await this.bot.sendMessage(chatId, `🤖 *AI Assistant*\n\n${response}`, 'Markdown');
-			}
+		let keyboard = undefined;
+		if (isCreatorResponse) {
+			keyboard = {
+				inline_keyboard: [
+					[
+						{
+							text: '💬 Contact Chico', 
+							url: 'https://t.me/chicorota0'
+						},
+						{
+							text: '🏠 Home',
+							callback_data: 'show_home'
+						}
+					],
+					[
+						{
+							text: '📝 Notes',
+							callback_data: 'refresh_notes'
+						},
+						{
+							text: '✅ Tasks',
+							callback_data: 'refresh_todos'
+						}
+					]
+				]
+			};
+			console.log('AI response contains creator info, adding keyboard:', JSON.stringify(keyboard));
+		}
 
-		} catch (error) {
-			console.error('AI Error:', error);
-			
-			// Edit processing message with error
-			const processingResponse = await processingMessage.json() as any;
-			const messageId = processingResponse.result?.message_id;
+		// Edit the processing message with the AI response
+		const processingResponse = await processingMessage.json() as any;
+		const messageId = processingResponse.result?.message_id;
 
-			if (messageId) {
-				await this.bot.editMessageText(
-					chatId, 
-					messageId, 
-					'❌ *AI Error*\n\n_Sorry, I encountered an issue processing your request. Please try again._', 
-					'Markdown'
-				);
-			}
+		if (messageId) {
+			await this.bot.editMessageText(
+				chatId, 
+				messageId, 
+				`🤖 *AI Assistant*\n\n${response}`, 
+				'Markdown',
+				keyboard
+			);
+		} else {
+			await this.bot.sendMessage(chatId, `🤖 *AI Assistant*\n\n${response}`, 'Markdown', keyboard);
+		}
+
+	} catch (error) {
+		console.error('AI Error:', error);
+		
+		// Edit processing message with error
+		const processingResponse = await processingMessage.json() as any;
+		const messageId = processingResponse.result?.message_id;
+
+		if (messageId) {
+			await this.bot.editMessageText(
+				chatId, 
+				messageId, 
+				'❌ *AI Error*\n\n_Sorry, I encountered an issue processing your request. Please try again._', 
+				'Markdown'
+			);
 		}
 	}
+}
 
 	async handlePhotoMessage(chatId: number, photos: TelegramPhoto[], caption?: string, firstName?: string, username?: string): Promise<void> {
 		await this.db.updateUserActivity(chatId);
@@ -1784,58 +1580,55 @@ Chico designed this bot to help people be more productive with smart notes, todo
 		);
 
 		try {
-			// Get the largest photo
-			const largestPhoto = photos.reduce((prev, current) => 
-				(prev.file_size || 0) > (current.file_size || 0) ? prev : current
-			);
-
+			// Get the largest photo (best quality)
+			const photo = photos[photos.length - 1];
+			
 			// Get file info from Telegram
-			const fileResponse = await this.bot.getFile(largestPhoto.file_id);
+			const fileResponse = await fetch(`https://api.telegram.org/bot${this.bot.botToken}/getFile?file_id=${photo.file_id}`);
 			const fileData = await fileResponse.json() as any;
 			
 			if (!fileData.ok) {
+				
 				throw new Error('Failed to get file info');
 			}
-
+			
 			// Download the image
-			const imageResponse = await this.bot.downloadFile(fileData.result.file_path);
+			const imageUrl = `https://api.telegram.org/file/bot${this.bot.botToken}/${fileData.result.file_path}`;
+			const imageResponse = await fetch(imageUrl);
 			const imageBuffer = await imageResponse.arrayBuffer();
-
-			// Use Cloudflare AI for image-to-text
-			const aiResponse = await this.ai.run('@cf/unum/uform-gen2-qwen-500m', {
+			
+			// Convert to base64 for AI processing
+			const uint8Array = new Uint8Array(imageBuffer);
+			const base64Image = btoa(String.fromCharCode.apply(null, Array.from(uint8Array)));
+			
+			// Use Cloudflare AI to analyze the image
+			const aiResponse = await this.ai.run('@cf/llava-hf/llava-1.5-7b-hf', {
 				image: Array.from(new Uint8Array(imageBuffer)),
-				prompt: caption || "What is in this image? Describe it in detail.",
+				prompt: caption ? 
+					`Analyze this image and also consider this caption: "${caption}". Provide a detailed description of what you see.` :
+					"Analyze this image and provide a detailed description of what you see.",
 				max_tokens: 512
 			});
 
-			const description = aiResponse.description || 'Could not analyze the image.';
+			const description = aiResponse.description || 'I can see an image, but I cannot provide a detailed description at the moment.';
 
-			// Edit the processing message with the result
+			// Edit the processing message with the AI response
 			const processingResponse = await processingMessage.json() as any;
 			const messageId = processingResponse.result?.message_id;
 
 			if (messageId) {
-				let message = `🖼️ *Image Analysis*\n\n${description}`;
-				if (caption) {
-					message += `\n\n💬 _Your caption: "${caption}"_`;
-				}
-
 				await this.bot.editMessageText(
 					chatId, 
 					messageId, 
-					message, 
+					`🖼️ *Image Analysis*\n\n${description}`, 
 					'Markdown'
 				);
 			} else {
-				let message = `🖼️ *Image Analysis*\n\n${description}`;
-				if (caption) {
-					message += `\n\n💬 _Your caption: "${caption}"_`;
-				}
-				await this.bot.sendMessage(chatId, message, 'Markdown');
+				await this.bot.sendMessage(chatId, `🖼️ *Image Analysis*\n\n${description}`, 'Markdown');
 			}
 
 		} catch (error) {
-			console.error('Image AI Error:', error);
+			console.error('Image Analysis Error:', error);
 			
 			// Edit processing message with error
 			const processingResponse = await processingMessage.json() as any;

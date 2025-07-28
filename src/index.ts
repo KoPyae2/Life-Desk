@@ -12,6 +12,7 @@ type Bindings = {
 	BOT_TOKEN: string;
 	DB: D1Database;
 	AI: Ai;
+	FREEPIK_API_KEY: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -84,9 +85,8 @@ app.get('/', (c) => {
 						<a href="/webhook-info">Webhook Info</a>
 						<a href="/delete-webhook">Delete Webhook</a>
 						<a href="/db-stats">Database Stats</a>
-						<a href="/debug-reminders">Debug Reminders</a>
-						<a href="/force-check-reminders">Force Check Reminders</a>
-						<a href="/test-reminder">Test Reminder (1 min)</a>
+						<a href="/test-image">Test Image Generation</a>
+
 					</div>
 				</div>
 			</body>
@@ -100,26 +100,11 @@ app.post('/webhook', async (c) => {
 		const bot = new TelegramBot(c.env.BOT_TOKEN);
 		const update: TelegramUpdate = await c.req.json();
 		
-		await handleTelegramUpdate(update, bot, c.env.DB, c.env.AI);
+		await handleTelegramUpdate(update, bot, c.env.DB, c.env.AI, c.env.FREEPIK_API_KEY);
 		return c.text('OK');
 	} catch (error) {
 		console.error('Error processing webhook:', error);
 		return c.text('Error processing webhook', 500);
-	}
-});
-
-// Smart Reminders checking endpoint
-app.post('/check-reminders', async (c) => {
-	try {
-		const bot = new TelegramBot(c.env.BOT_TOKEN);
-		const { CommandHandler } = await import('./commands');
-		const commandHandler = new CommandHandler(bot, c.env.DB, c.env.AI);
-		
-		await commandHandler.checkAndSendReminders();
-		return c.json({ success: true, message: 'Reminders checked' });
-	} catch (error) {
-		console.error('Error checking reminders:', error);
-		return c.json({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }, 500);
 	}
 });
 
@@ -177,117 +162,6 @@ app.get('/delete-webhook', async (c) => {
 	}
 });
 
-// Debug reminders endpoint
-app.get('/debug-reminders', async (c) => {
-	try {
-		const { CommandHandler } = await import('./commands');
-		const bot = new TelegramBot(c.env.BOT_TOKEN);
-		const commandHandler = new CommandHandler(bot, c.env.DB, c.env.AI);
-		
-		// Get all reminders
-		const allReminders = await c.env.DB.prepare(`
-			SELECT * FROM reminders 
-			ORDER BY reminder_time ASC
-		`).all();
-		
-		const now = Date.now();
-		
-		// Get pending reminders directly
-		const pendingResult = await c.env.DB.prepare(`
-			SELECT * FROM reminders 
-			WHERE is_sent = 0 AND reminder_time <= ?
-			ORDER BY reminder_time ASC
-		`).bind(now).all();
-		
-		const pendingReminders = pendingResult.results?.map(row => ({
-			id: row.id as number,
-			userId: row.user_id as number,
-			content: row.content as string,
-			reminderTime: row.reminder_time as number,
-			isSent: Boolean(row.is_sent),
-			sourceType: row.source_type as 'note' | 'todo' | 'manual',
-			sourceId: row.source_id as string | undefined,
-			createdAt: row.created_at as number
-		})) || [];
-		
-		return c.json({
-			current_time: now,
-			current_time_readable: new Date(now).toLocaleString(),
-			all_reminders: allReminders.results?.map(row => ({
-				id: row.id,
-				user_id: row.user_id,
-				content: row.content,
-				reminder_time: row.reminder_time,
-				reminder_time_readable: new Date(row.reminder_time as number).toLocaleString(),
-				is_sent: row.is_sent,
-				source_type: row.source_type,
-				created_at: row.created_at
-			})) || [],
-			pending_reminders_count: pendingReminders.length,
-			pending_reminders: pendingReminders
-		});
-	} catch (error) {
-		console.error('Error debugging reminders:', error);
-		return c.json({ success: false, error: error instanceof Error ? error.message : 'Unknown error' }, 500);
-	}
-});
-
-// Force check reminders endpoint
-app.get('/force-check-reminders', async (c) => {
-	try {
-		const bot = new TelegramBot(c.env.BOT_TOKEN);
-		const { CommandHandler } = await import('./commands');
-		const commandHandler = new CommandHandler(bot, c.env.DB, c.env.AI);
-		
-		await commandHandler.checkAndSendReminders();
-		
-		return c.json({
-			success: true,
-			message: 'Reminders checked and sent!',
-			timestamp: new Date().toLocaleString()
-		});
-	} catch (error) {
-		console.error('Error force checking reminders:', error);
-		return c.json({
-			success: false,
-			error: error instanceof Error ? error.message : 'Unknown error'
-		}, 500);
-	}
-});
-
-// Test reminder endpoint - creates a reminder for 1 minute from now
-app.get('/test-reminder', async (c) => {
-	try {
-		const bot = new TelegramBot(c.env.BOT_TOKEN);
-		const { CommandHandler } = await import('./commands');
-		const commandHandler = new CommandHandler(bot, c.env.DB, c.env.AI);
-		
-		// Create a test reminder for 1 minute from now
-		const now = Date.now();
-		const oneMinuteFromNow = now + (60 * 1000); // 1 minute
-		
-		await c.env.DB.prepare(`
-			INSERT INTO reminders (user_id, content, reminder_time, is_sent, source_type, created_at)
-			VALUES (?, ?, ?, 0, 'manual', ?)
-		`).bind(5147071138, 'Test reminder - 1 minute', oneMinuteFromNow, now).run();
-		
-		return c.json({
-			success: true,
-			message: 'Test reminder created for 1 minute from now',
-			current_time: now,
-			current_time_readable: new Date(now).toLocaleString(),
-			reminder_time: oneMinuteFromNow,
-			reminder_time_readable: new Date(oneMinuteFromNow).toLocaleString()
-		});
-	} catch (error) {
-		console.error('Error creating test reminder:', error);
-		return c.json({
-			success: false,
-			error: error instanceof Error ? error.message : 'Unknown error'
-		}, 500);
-	}
-});
-
 // Database stats endpoint (for debugging)
 app.get('/db-stats', async (c) => {
 	try {
@@ -316,6 +190,51 @@ app.get('/db-stats', async (c) => {
 	}
 });
 
+// Test image generation endpoint
+app.get('/test-image', async (c) => {
+	try {
+		console.log('Testing Freepik API...');
+		
+		const FREEPIK_API_URL = `https://api.freepik.com/v1/ai/text-to-image`;
+		const requestBody = {
+			prompt: "A simple test image of a cat",
+			styling: {
+				style: "photo",
+				color: "pastel",
+				lightning: "cinematic",
+				framing: "aerial-view",
+			},
+			image: {
+				size: "social_story_9_16",
+			},
+		};
+
+		const response = await fetch(FREEPIK_API_URL, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-freepik-api-key": c.env.FREEPIK_API_KEY,
+			},
+			body: JSON.stringify(requestBody),
+		});
+
+		const data = await response.json();
+		
+		return c.json({
+			status: response.status,
+			statusText: response.statusText,
+			apiKeyPresent: !!c.env.FREEPIK_API_KEY,
+			apiKeyLength: c.env.FREEPIK_API_KEY?.length || 0,
+			responseData: data
+		});
+	} catch (error) {
+		return c.json({
+			error: error instanceof Error ? error.message : 'Unknown error',
+			stack: error instanceof Error ? error.stack : undefined
+		}, 500);
+	}
+});
+
 // 404 handler
 app.notFound((c) => {
 	return c.text('Not Found', 404);
@@ -328,10 +247,7 @@ export default {
 		try {
 			const bot = new TelegramBot(env.BOT_TOKEN);
 			const { CommandHandler } = await import('./commands');
-			const commandHandler = new CommandHandler(bot, env.DB, env.AI);
-			
-			await commandHandler.checkAndSendReminders();
-			console.log('Scheduled reminder check completed');
+			console.log('Scheduled reminder check skipped - feature removed');
 		} catch (error) {
 			console.error('Error in scheduled reminder check:', error);
 		}

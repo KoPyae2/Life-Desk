@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_id INTEGER UNIQUE NOT NULL,
     first_name TEXT NOT NULL,
     username TEXT,
+    timezone TEXT DEFAULT 'UTC',
+    timezone_offset INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL,
     last_active_at INTEGER NOT NULL
 );
@@ -53,19 +55,6 @@ CREATE TABLE IF NOT EXISTS user_input_states (
     FOREIGN KEY (user_id) REFERENCES users (telegram_id)
 );
 
--- Reminders table (AI-powered smart reminders)
-CREATE TABLE IF NOT EXISTS reminders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    content TEXT NOT NULL,
-    reminder_time INTEGER NOT NULL,
-    is_sent BOOLEAN DEFAULT FALSE,
-    source_type TEXT CHECK(source_type IN ('note', 'todo', 'manual')) NOT NULL,
-    source_id INTEGER,
-    created_at INTEGER NOT NULL,
-    FOREIGN KEY (user_id) REFERENCES users (telegram_id)
-);
-
 -- Indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id);
 CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
@@ -75,6 +64,3 @@ CREATE INDEX IF NOT EXISTS idx_expenses_user_id ON expenses(user_id);
 CREATE INDEX IF NOT EXISTS idx_expenses_created_at ON expenses(created_at);
 CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_user_input_states_user_id ON user_input_states(user_id);
-CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id);
-CREATE INDEX IF NOT EXISTS idx_reminders_time ON reminders(reminder_time);
-CREATE INDEX IF NOT EXISTS idx_reminders_sent ON reminders(is_sent);
